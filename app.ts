@@ -38,23 +38,105 @@ function nextRequestId(): string {
   return `req-${requestCounter}`;
 }
 
-function expectedToken(): string {
-  return process.env.MAKEFUN_SHOP_TOKEN ?? '';
-}
+// The trial token is fixed for the process's lifetime; read it once instead
+// of hitting process.env on every request.
+const EXPECTED_TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
 
 function isAuthorized(req: IncomingMessage): boolean {
-  const expected = expectedToken();
-  if (!expected) return true;
+  if (!EXPECTED_TOKEN) return true;
   const header = req.headers.authorization ?? '';
-  return header === `Bearer ${expected}`;
+  return header === `Bearer ${EXPECTED_TOKEN}`;
+}
+
+// Minimal query-string reader: scans for one key at a time with the same
+// decoding rules as URLSearchParams (percent-decoding, '+' as space), without
+// building a URL object per request. Handlers that rebuild the whole query
+// (pagination links) use params() for a real URLSearchParams, lazily.
+class Query {
+  private cache = new Map<string, string | null>();
+  private all: URLSearchParams | null = null;
+  private qs: string;
+
+  constructor(qs: string) {
+    this.qs = qs;
+  }
+
+  get(name: string): string | null {
+    const hit = this.cache.get(name);
+    if (hit !== undefined) return hit;
+    let result: string | null = null;
+    const qs = this.qs;
+    let i = 0;
+    for (;;) {
+      const amp = qs.indexOf('&', i);
+      const pair = amp < 0 ? qs.slice(i) : qs.slice(i, amp);
+      const eq = pair.indexOf('=');
+      const rawKey = eq < 0 ? pair : pair.slice(0, eq);
+      let key = rawKey;
+      if (rawKey.includes('%') || rawKey.includes('+')) {
+        try {
+          key = decodeURIComponent(rawKey.replace(/\+/g, ' '));
+        } catch {
+          key = rawKey;
+        }
+      }
+      if (key === name) {
+        const rawVal = eq < 0 ? '' : pair.slice(eq + 1);
+        if (rawVal.includes('%') || rawVal.includes('+')) {
+          try {
+            result = decodeURIComponent(rawVal.replace(/\+/g, ' '));
+          } catch {
+            result = rawVal;
+          }
+        } else {
+          result = rawVal;
+        }
+        break;
+      }
+      if (amp < 0) break;
+      i = amp + 1;
+      if (i > qs.length) break;
+    }
+    this.cache.set(name, result);
+    return result;
+  }
+
+  params(): URLSearchParams {
+    if (!this.all) this.all = new URLSearchParams(this.qs);
+    return this.all;
+  }
+}
+
+const EMPTY_QUERY = new Query('');
+
+function parseRequestTarget(rawUrl: string): { pathname: string; query: Query } {
+  // Absolute-form targets (a proxy's) still go through URL parsing.
+  if (rawUrl.startsWith('http://') || rawUrl.startsWith('https://')) {
+    const url = new URL(rawUrl);
+    return { pathname: decodePath(url.pathname), query: new Query(url.search.slice(1)) };
+  }
+  const q = rawUrl.indexOf('?');
+  const rawPath = q < 0 ? rawUrl : rawUrl.slice(0, q);
+  return { pathname: decodePath(rawPath), query: q < 0 ? EMPTY_QUERY : new Query(rawUrl.slice(q + 1)) };
+}
+
+function decodePath(pathname: string): string {
+  if (!pathname.includes('%')) return pathname;
+  try {
+    return decodeURIComponent(pathname);
+  } catch {
+    return pathname;
+  }
 }
 
 function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
+    let total = 0;
     req.on('data', (chunk: Buffer) => {
       chunks.push(chunk);
-      if (Buffer.byteLength(Buffer.concat(chunks)) > 256 * 1024 * 1024) {
+      total += chunk.length;
+      if (total > 256 * 1024 * 1024) {
         reject(new Error('request body too large'));
         req.destroy();
       }
@@ -75,8 +157,7 @@ function sendJson(res: ServerResponse, status: number, value: unknown, extraHead
   res.end(body);
 }
 
-function sendJsonText(res: ServerResponse, status: number, text: string, extraHeaders: Record<string, string> = {}): void {
-  const body = Buffer.from(text, 'utf8');
+function sendJsonBuffer(res: ServerResponse, status: number, body: Buffer, extraHeaders: Record<string, string> = {}): void {
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
     'content-length': body.length,
@@ -100,12 +181,21 @@ function errorJson(message: string): Record<string, unknown> {
   return { message, documentation_url: 'https://example.invalid/docs' };
 }
 
+// The suite dials one host for the whole trial; memoize the base URL per host.
+const baseUrlCache = new Map<string, string>();
+
 function baseUrlOf(req: IncomingMessage): string {
   const host = req.headers.host ?? '127.0.0.1';
-  return `http://${host}/api/v3`;
+  let base = baseUrlCache.get(host);
+  if (base === undefined) {
+    base = `http://${host}/api/v3`;
+    if (baseUrlCache.size > 16) baseUrlCache.clear();
+    baseUrlCache.set(host, base);
+  }
+  return base;
 }
 
-function pageParams(query: URLSearchParams): { page: number; perPage: number } {
+function pageParams(query: Query): { page: number; perPage: number } {
   const pageRaw = Number.parseInt(query.get('page') ?? '1', 10);
   const perRaw = Number.parseInt(query.get('per_page') ?? '30', 10);
   const page = Number.isFinite(pageRaw) && pageRaw > 0 ? pageRaw : 1;
@@ -119,10 +209,11 @@ function paginate<T>(items: T[], page: number, perPage: number): { pageItems: T[
   return { pageItems: items.slice(start, start + perPage), totalPages };
 }
 
-function linkHeader(req: IncomingMessage, path: string, query: URLSearchParams, page: number, perPage: number, totalPages: number): string | null {
+function linkHeader(req: IncomingMessage, path: string, query: Query, page: number, perPage: number, totalPages: number): string | null {
   const host = req.headers.host ?? '127.0.0.1';
+  const params = query.params();
   const build = (p: number): string => {
-    const q = new URLSearchParams(query);
+    const q = new URLSearchParams(params);
     q.set('page', String(p));
     q.set('per_page', String(perPage));
     return `<http://${host}${path}?${q.toString()}>`;
@@ -223,13 +314,13 @@ function handleMeta(res: ServerResponse): void {
   });
 }
 
-function handleUserReposList(forge: Forge, req: IncomingMessage, res: ServerResponse, url: URL): void {
-  const { page, perPage } = pageParams(url.searchParams);
+function handleUserReposList(forge: Forge, req: IncomingMessage, res: ServerResponse, pathname: string, query: Query): void {
+  const { page, perPage } = pageParams(query);
   const repos = forge.listRepos();
   const { pageItems, totalPages } = paginate(repos, page, perPage);
   const base = baseUrlOf(req);
   const headers: Record<string, string> = {};
-  const link = linkHeader(req, url.pathname, url.searchParams, page, perPage, totalPages);
+  const link = linkHeader(req, pathname, query, page, perPage, totalPages);
   if (link) headers.link = link;
   sendJson(res, 200, pageItems.map((repo) => repoJson(repo, base)), headers);
 }
@@ -358,9 +449,9 @@ function handleRefDelete(repo: Repo, res: ServerResponse, rest: string[]): void 
   sendNoContent(res);
 }
 
-function handleCommitsList(repo: Repo, req: IncomingMessage, res: ServerResponse, url: URL): void {
-  const { page, perPage } = pageParams(url.searchParams);
-  const shaParam = url.searchParams.get('sha');
+function handleCommitsList(repo: Repo, req: IncomingMessage, res: ServerResponse, pathname: string, query: Query): void {
+  const { page, perPage } = pageParams(query);
+  const shaParam = query.get('sha');
   const tip = shaParam ? repo.resolveToCommit(shaParam) : repo.resolveToCommit(`refs/heads/${repo.defaultBranch}`);
   const base = baseUrlOf(req);
   if (!tip) {
@@ -370,7 +461,7 @@ function handleCommitsList(repo: Repo, req: IncomingMessage, res: ServerResponse
   const all = repo.history(tip, 100000);
   const { pageItems, totalPages } = paginate(all, page, perPage);
   const headers: Record<string, string> = {};
-  const link = linkHeader(req, url.pathname, url.searchParams, page, perPage, totalPages);
+  const link = linkHeader(req, pathname, query, page, perPage, totalPages);
   if (link) headers.link = link;
   const items: Record<string, unknown>[] = [];
   for (const oid of pageItems) {
@@ -450,9 +541,9 @@ function subtreeOid(repo: Repo, commitOid: string, dirPath: string): string | un
   return current;
 }
 
-function handleContentsGet(repo: Repo, req: IncomingMessage, res: ServerResponse, url: URL, pathParts: string[]): void {
+function handleContentsGet(repo: Repo, req: IncomingMessage, res: ServerResponse, query: Query, pathParts: string[]): void {
   const base = baseUrlOf(req);
-  const ref = url.searchParams.get('ref') ?? repo.defaultBranch;
+  const ref = query.get('ref') ?? repo.defaultBranch;
   const tip = repo.resolveToCommit(ref);
   if (!tip) {
     sendJson(res, 404, errorJson('Not Found'));
@@ -649,10 +740,10 @@ function handleIssuesCreate(forge: Forge, repo: Repo, req: IncomingMessage, res:
   sendJson(res, 201, issueJson(repo, result.issue, baseUrlOf(req)));
 }
 
-function handleIssuesList(repo: Repo, req: IncomingMessage, res: ServerResponse, url: URL): void {
-  const { page, perPage } = pageParams(url.searchParams);
-  const state = url.searchParams.get('state') ?? 'open';
-  const direction = url.searchParams.get('direction') ?? 'desc';
+function handleIssuesList(repo: Repo, req: IncomingMessage, res: ServerResponse, pathname: string, query: Query): void {
+  const { page, perPage } = pageParams(query);
+  const state = query.get('state') ?? 'open';
+  const direction = query.get('direction') ?? 'desc';
   const base = baseUrlOf(req);
   type Row = { seq: number; json: Record<string, unknown>; state: string };
   const rows: Row[] = [];
@@ -666,7 +757,7 @@ function handleIssuesList(repo: Repo, req: IncomingMessage, res: ServerResponse,
   filtered.sort((a, b) => (direction === 'asc' ? a.seq - b.seq : b.seq - a.seq));
   const { pageItems, totalPages } = paginate(filtered, page, perPage);
   const headers: Record<string, string> = {};
-  const link = linkHeader(req, url.pathname, url.searchParams, page, perPage, totalPages);
+  const link = linkHeader(req, pathname, query, page, perPage, totalPages);
   if (link) headers.link = link;
   sendJson(res, 200, pageItems.map((row) => row.json), headers);
 }
@@ -680,7 +771,6 @@ function findIssueOrPull(repo: Repo, n: number): { issue: IssueRec } | { pull: P
 }
 
 function handleIssueGet(repo: Repo, req: IncomingMessage, res: ServerResponse, n: number): void {
-  const base = baseUrlOf(req);
   const found = findIssueOrPull(repo, n);
   if (!found) {
     sendJson(res, 404, errorJson('Not Found'));
@@ -689,15 +779,15 @@ function handleIssueGet(repo: Repo, req: IncomingMessage, res: ServerResponse, n
   if ('issue' in found) {
     const cached = repo.issueJsonCache.get(n);
     if (cached) {
-      sendJsonText(res, 200, cached);
+      sendJsonBuffer(res, 200, cached);
       return;
     }
-    const text = JSON.stringify(issueJson(repo, found.issue, base));
-    repo.issueJsonCache.set(n, text);
-    sendJsonText(res, 200, text);
+    const body = Buffer.from(JSON.stringify(issueJson(repo, found.issue, baseUrlOf(req))), 'utf8');
+    repo.issueJsonCache.set(n, body);
+    sendJsonBuffer(res, 200, body);
     return;
   }
-  sendJson(res, 200, pullIssueJson(repo, found.pull, base));
+  sendJson(res, 200, pullIssueJson(repo, found.pull, baseUrlOf(req)));
 }
 
 function handleIssuePatch(repo: Repo, req: IncomingMessage, res: ServerResponse, n: number, body: Record<string, unknown>): void {
@@ -779,16 +869,16 @@ function handlePullsCreate(forge: Forge, repo: Repo, req: IncomingMessage, res: 
   sendJson(res, 201, pullJson(repo, result.pull, baseUrlOf(req)));
 }
 
-function handlePullsList(repo: Repo, req: IncomingMessage, res: ServerResponse, url: URL): void {
-  const { page, perPage } = pageParams(url.searchParams);
-  const state = url.searchParams.get('state') ?? 'open';
+function handlePullsList(repo: Repo, req: IncomingMessage, res: ServerResponse, pathname: string, query: Query): void {
+  const { page, perPage } = pageParams(query);
+  const state = query.get('state') ?? 'open';
   const base = baseUrlOf(req);
   let pulls = [...repo.pulls.values()];
   if (state !== 'all') pulls = pulls.filter((pull) => pull.state === state);
   pulls.sort((a, b) => b.seq - a.seq);
   const { pageItems, totalPages } = paginate(pulls, page, perPage);
   const headers: Record<string, string> = {};
-  const link = linkHeader(req, url.pathname, url.searchParams, page, perPage, totalPages);
+  const link = linkHeader(req, pathname, query, page, perPage, totalPages);
   if (link) headers.link = link;
   sendJson(res, 200, pageItems.map((pull) => pullJson(repo, pull, base)), headers);
 }
@@ -1185,7 +1275,7 @@ function handleGraphQL(forge: Forge, req: IncomingMessage, res: ServerResponse, 
 
 // --- REST router -------------------------------------------------------------------
 
-function handleRest(forge: Forge, req: IncomingMessage, res: ServerResponse, url: URL, body: Buffer): void {
+function handleRest(forge: Forge, req: IncomingMessage, res: ServerResponse, pathname: string, query: Query, body: Buffer): void {
   if (!isAuthorized(req)) {
     sendJson(res, 401, errorJson('Bad credentials'));
     return;
@@ -1207,12 +1297,6 @@ function handleRest(forge: Forge, req: IncomingMessage, res: ServerResponse, url
     bodyRecord = record ?? {};
   }
 
-  let pathname = url.pathname;
-  try {
-    pathname = decodeURIComponent(pathname);
-  } catch {
-    // keep the raw pathname
-  }
   const restPath = pathname === '/api/v3' ? '/' : pathname.slice('/api/v3'.length);
   const segments = restPath.split('/').filter((s) => s.length > 0);
 
@@ -1243,7 +1327,7 @@ function handleRest(forge: Forge, req: IncomingMessage, res: ServerResponse, url
   }
   if (segments[0] === 'user' && segments[1] === 'repos' && segments.length === 2) {
     if (method === 'GET') {
-      handleUserReposList(forge, req, res, url);
+      handleUserReposList(forge, req, res, pathname, query);
       return;
     }
     if (method === 'POST') {
@@ -1320,7 +1404,7 @@ function handleRest(forge: Forge, req: IncomingMessage, res: ServerResponse, url
     }
     if (head === 'commits') {
       if (rest.length === 1 && method === 'GET') {
-        handleCommitsList(repo, req, res, url);
+        handleCommitsList(repo, req, res, pathname, query);
         return;
       }
       if (rest.length === 2 && method === 'GET') {
@@ -1332,7 +1416,7 @@ function handleRest(forge: Forge, req: IncomingMessage, res: ServerResponse, url
     }
     if (head === 'contents') {
       if (method === 'GET') {
-        handleContentsGet(repo, req, res, url, rest.slice(1));
+        handleContentsGet(repo, req, res, query, rest.slice(1));
         return;
       }
       if (method === 'PUT') {
@@ -1369,7 +1453,7 @@ function handleRest(forge: Forge, req: IncomingMessage, res: ServerResponse, url
     if (head === 'issues') {
       if (rest.length === 1) {
         if (method === 'GET') {
-          handleIssuesList(repo, req, res, url);
+          handleIssuesList(repo, req, res, pathname, query);
           return;
         }
         if (method === 'POST') {
@@ -1414,7 +1498,7 @@ function handleRest(forge: Forge, req: IncomingMessage, res: ServerResponse, url
     if (head === 'pulls') {
       if (rest.length === 1) {
         if (method === 'GET') {
-          handlePullsList(repo, req, res, url);
+          handlePullsList(repo, req, res, pathname, query);
           return;
         }
         if (method === 'POST') {
@@ -1461,13 +1545,7 @@ function handleRest(forge: Forge, req: IncomingMessage, res: ServerResponse, url
 
 // --- git router ----------------------------------------------------------------------
 
-function handleGit(forge: Forge, req: IncomingMessage, res: ServerResponse, url: URL, body: Buffer): void {
-  let pathname = url.pathname;
-  try {
-    pathname = decodeURIComponent(pathname);
-  } catch {
-    // keep raw
-  }
+function handleGit(forge: Forge, req: IncomingMessage, res: ServerResponse, pathname: string, query: Query, body: Buffer): void {
   const segments = pathname.split('/').filter((s) => s.length > 0);
   if (segments.length < 2 || !segments[1].endsWith('.git')) {
     sendJson(res, 404, errorJson('Not Found'));
@@ -1478,7 +1556,7 @@ function handleGit(forge: Forge, req: IncomingMessage, res: ServerResponse, url:
   const tail = segments.slice(2);
   const method = req.method ?? 'GET';
   if (method === 'GET' && tail.length === 2 && tail[0] === 'info' && tail[1] === 'refs') {
-    const service = url.searchParams.get('service');
+    const service = query.get('service');
     const gitProtocol = req.headers['git-protocol'] ?? '';
     const result = handleInfoRefs(forge, owner, repoName, service, gitProtocol);
     sendRaw(res, result.status, result.contentType, result.body);
@@ -1502,48 +1580,81 @@ function handleGit(forge: Forge, req: IncomingMessage, res: ServerResponse, url:
 export function createForgeServer(): { server: Server; forge: Forge } {
   const forge = new Forge();
   const server = createServer((req, res) => {
-    void (async () => {
-      try {
-        const url = new URL(req.url ?? '/', 'http://localhost');
-        const pathname = url.pathname;
-        if (pathname === '/healthz' && (req.method ?? 'GET') === 'GET') {
-          sendJson(res, 200, { ok: true });
-          return;
-        }
-        const body = await readBody(req);
-        if (pathname === '/api/graphql' || pathname === '/api/graphql/') {
-          if ((req.method ?? 'GET') !== 'POST') {
-            sendJson(res, 404, errorJson('Not Found'));
-            return;
-          }
-          handleGraphQL(forge, req, res, body);
-          return;
-        }
-        if (pathname === '/mcp' || pathname === '/mcp/') {
-          if ((req.method ?? 'GET') !== 'POST') {
-            sendJson(res, 405, errorJson('Method Not Allowed'));
-            return;
-          }
-          handleMcp(forge, req, res, body);
-          return;
-        }
-        if (pathname === '/api/v3' || pathname.startsWith('/api/v3/')) {
-          handleRest(forge, req, res, url, body);
-          return;
-        }
-        handleGit(forge, req, res, url, body);
-      } catch (err) {
-        if (!res.headersSent) {
-          try {
-            sendJson(res, 500, errorJson((err as Error).message));
-          } catch {
-            res.destroy();
-          }
-        } else {
-          res.destroy();
-        }
+    try {
+      const { pathname, query } = parseRequestTarget(req.url ?? '/');
+      if (pathname === '/healthz' && (req.method ?? 'GET') === 'GET') {
+        sendJson(res, 200, { ok: true });
+        return;
       }
-    })();
+      if (!requestHasBody(req)) {
+        // Bodyless requests (every GET, and POSTs without framing) run
+        // synchronously: no stream wait, no promise, no extra event-loop turn.
+        dispatch(forge, req, res, pathname, query, EMPTY_BODY);
+        return;
+      }
+      void (async () => {
+        try {
+          const body = await readBody(req);
+          dispatch(forge, req, res, pathname, query, body);
+        } catch (err) {
+          failRequest(res, err);
+        }
+      })();
+    } catch (err) {
+      failRequest(res, err);
+    }
   });
   return { server, forge };
+}
+
+const EMPTY_BODY = Buffer.alloc(0);
+
+// A request carries a body only when its framing says so: a positive
+// Content-Length or a Transfer-Encoding. Anything else is bodyless by the
+// HTTP/1.1 rules, so answering without consuming the stream cannot desync a
+// keep-alive connection.
+function requestHasBody(req: IncomingMessage): boolean {
+  const length = req.headers['content-length'];
+  if (length !== undefined) {
+    // Only an unambiguous zero means "no body by Content-Length"; anything
+    // else (positive, unparseable, repeated) reads the stream.
+    if (Number(length) !== 0) return true;
+  }
+  return req.headers['transfer-encoding'] !== undefined;
+}
+
+function dispatch(forge: Forge, req: IncomingMessage, res: ServerResponse, pathname: string, query: Query, body: Buffer): void {
+  if (pathname === '/api/graphql' || pathname === '/api/graphql/') {
+    if ((req.method ?? 'GET') !== 'POST') {
+      sendJson(res, 404, errorJson('Not Found'));
+      return;
+    }
+    handleGraphQL(forge, req, res, body);
+    return;
+  }
+  if (pathname === '/mcp' || pathname === '/mcp/') {
+    if ((req.method ?? 'GET') !== 'POST') {
+      sendJson(res, 405, errorJson('Method Not Allowed'));
+      return;
+    }
+    handleMcp(forge, req, res, body);
+    return;
+  }
+  if (pathname === '/api/v3' || pathname.startsWith('/api/v3/')) {
+    handleRest(forge, req, res, pathname, query, body);
+    return;
+  }
+  handleGit(forge, req, res, pathname, query, body);
+}
+
+function failRequest(res: ServerResponse, err: unknown): void {
+  if (!res.headersSent) {
+    try {
+      sendJson(res, 500, errorJson((err as Error).message));
+    } catch {
+      res.destroy();
+    }
+  } else {
+    res.destroy();
+  }
 }

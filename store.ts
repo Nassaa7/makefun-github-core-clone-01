@@ -37,6 +37,8 @@ export const VIEWER = {
   email: 'adaiversen@example.invalid',
 };
 
+const VIEWER_LOGIN_LOWER = VIEWER.login.toLowerCase();
+
 function trialNow(): { epoch: number; iso: string } {
   const raw = process.env.MAKEFUN_TRIAL_NOW ?? '';
   if (raw) {
@@ -201,14 +203,23 @@ export type PktPacket =
   | { kind: 'flush' }
   | { kind: 'delim' };
 
+function isHex4(buf: Buffer, offset: number): boolean {
+  for (let i = 0; i < 4; i += 1) {
+    const c = buf[offset + i];
+    const digit = (c >= 0x30 && c <= 0x39) || (c >= 0x61 && c <= 0x66) || (c >= 0x41 && c <= 0x46);
+    if (!digit) return false;
+  }
+  return true;
+}
+
 export function decodePktLines(buf: Buffer): { packets: PktPacket[]; consumed: number; complete: boolean } {
   const packets: PktPacket[] = [];
   let offset = 0;
   while (offset + 4 <= buf.length) {
-    const header = buf.subarray(offset, offset + 4).toString('ascii');
-    if (!/^[0-9a-fA-F]{4}$/.test(header)) {
+    if (!isHex4(buf, offset)) {
       return { packets, consumed: offset, complete: false };
     }
+    const header = buf.subarray(offset, offset + 4).toString('ascii');
     const length = parseInt(header, 16);
     if (length === 0) {
       packets.push({ kind: 'flush' });
@@ -236,8 +247,8 @@ export function readUntilFlush(buf: Buffer): { packets: PktPacket[]; next: numbe
   const packets: PktPacket[] = [];
   let offset = 0;
   while (offset + 4 <= buf.length) {
+    if (!isHex4(buf, offset)) throw new Error('not a pkt-line stream');
     const header = buf.subarray(offset, offset + 4).toString('ascii');
-    if (!/^[0-9a-fA-F]{4}$/.test(header)) throw new Error('not a pkt-line stream');
     const length = parseInt(header, 16);
     if (length === 0) {
       packets.push({ kind: 'flush' });
@@ -390,6 +401,7 @@ export function readPack(pack: Buffer, resolveBase?: (oid: string) => GitObj | u
   const raw: RawPackEntry[] = [];
   const byOffset = new Map<number, RawPackEntry>();
   let offset = 12;
+  let hasDelta = false;
   for (let index = 0; index < declaredCount; index += 1) {
     const entryOffset = offset;
     const header = readPackSizeHeader(pack, offset);
@@ -397,6 +409,7 @@ export function readPack(pack: Buffer, resolveBase?: (oid: string) => GitObj | u
     const typeCode = (header.first >> 4) & 0x07;
     const entry: RawPackEntry = { offset: entryOffset, typeCode, size: header.size, data: Buffer.alloc(0) };
     if (typeCode === 6) {
+      hasDelta = true;
       const base = readOfsBase(pack, offset);
       offset = base.next;
       if (base.baseDistance <= 0 || base.baseDistance > entryOffset) {
@@ -404,6 +417,7 @@ export function readPack(pack: Buffer, resolveBase?: (oid: string) => GitObj | u
       }
       entry.baseOffset = entryOffset - base.baseDistance;
     } else if (typeCode === 7) {
+      hasDelta = true;
       if (offset + 20 > trailerStart) throw new Error('ref-delta base id is truncated');
       entry.baseOid = pack.subarray(offset, offset + 20).toString('hex');
       offset += 20;
@@ -420,6 +434,19 @@ export function readPack(pack: Buffer, resolveBase?: (oid: string) => GitObj | u
   if (offset !== trailerStart) throw new Error('pack has stray bytes before its trailer');
 
   const objects = new Map<string, GitObj>();
+
+  // Fast path: a pack with no deltas resolves inline — hash each entry as
+  // parsed, with no resolver maps or second pass. Identical result to the
+  // general path below (first occurrence wins on duplicate oids).
+  if (!hasDelta) {
+    for (const entry of raw) {
+      const type = CODE_TYPE[entry.typeCode];
+      const oid = hashObject(type, entry.data);
+      if (!objects.has(oid)) objects.set(oid, { type, data: entry.data });
+    }
+    return objects;
+  }
+
   const resolvedByOid = new Map<string, RawPackEntry>();
   const resolving = new Set<number>();
 
@@ -571,7 +598,7 @@ export class Repo {
   seq = 0;
   version = 0;
   fetchCache = new Map<string, Buffer>();
-  issueJsonCache = new Map<number, string>();
+  issueJsonCache = new Map<number, Buffer>();
   private commitCache = new Map<string, CommitView>();
   private treeCache = new Map<string, Map<string, FlatEntry>>();
 
@@ -1092,7 +1119,9 @@ export class Forge {
   }
 
   findRepo(owner: string, name: string): Repo | undefined {
-    if (owner.toLowerCase() !== VIEWER.login.toLowerCase()) return undefined;
+    // Exact-case match first: the suite always uses the viewer's login
+    // verbatim, so the lower-case path is rarely taken.
+    if (owner !== VIEWER.login && owner.toLowerCase() !== VIEWER_LOGIN_LOWER) return undefined;
     return this.repos.get(name.toLowerCase());
   }
 

@@ -5,7 +5,6 @@
 import {
   Forge,
   NOW,
-  PKT_DELIM,
   PKT_FLUSH,
   ZERO_OID,
   buildCommit,
@@ -26,6 +25,32 @@ const AGENT = 'forge/1.0';
 
 const UPLOAD_V0_CAPS = `side-band-64k thin-pack ofs-delta shallow multi_ack_detailed agent=${AGENT}`;
 const RECEIVE_V0_CAPS = `report-status side-band-64k delete-refs ofs-delta agent=${AGENT}`;
+
+// --- pkt-line text builder ---------------------------------------------------
+// Text-only pkt-line streams are built as one string and turned into a single
+// Buffer, instead of one Buffer.concat per line. Byte-identical to pktLine()
+// per line: the 4-hex length counts the payload's UTF-8 bytes plus 4.
+
+function pktAppend(parts: string[], payload: string): void {
+  const len = Buffer.byteLength(payload, 'utf8') + 4;
+  parts.push(len.toString(16).padStart(4, '0'), payload);
+}
+
+function pktText(parts: string[]): Buffer {
+  return Buffer.from(parts.join(''), 'utf8');
+}
+
+// The protocol v2 capability advertisement never changes: build it once.
+const ADVERTISE_V2: Buffer = (() => {
+  const parts: string[] = [];
+  pktAppend(parts, 'version 2\n');
+  pktAppend(parts, 'ls-refs=unborn\n');
+  pktAppend(parts, 'fetch=shallow filter\n');
+  pktAppend(parts, 'object-format=sha1\n');
+  pktAppend(parts, `agent=${AGENT}\n`);
+  parts.push('0000');
+  return pktText(parts);
+})();
 
 export interface GitResponse {
   status: number;
@@ -60,25 +85,25 @@ function defaultBranchRef(repo: Repo): string {
 // --- info/refs ---------------------------------------------------------------
 
 function advertiseV0(repo: Repo, service: 'upload-pack' | 'receive-pack'): Buffer {
-  const parts: Buffer[] = [];
-  parts.push(pktLine(`# service=git-${service}\n`));
-  parts.push(PKT_FLUSH);
+  const parts: string[] = [];
+  pktAppend(parts, `# service=git-${service}\n`);
+  parts.push('0000');
   const caps = service === 'upload-pack' ? UPLOAD_V0_CAPS : RECEIVE_V0_CAPS;
   const headTarget = repo.refs.get(defaultBranchRef(repo));
   const refs = sortedRefs(repo);
   if (refs.length === 0) {
     const symref = service === 'upload-pack' ? ` symref=HEAD:${defaultBranchRef(repo)}` : '';
-    parts.push(pktLine(`${ZERO_OID} capabilities^{}\0${caps}${symref}\n`));
-    return Buffer.concat(parts);
+    pktAppend(parts, `${ZERO_OID} capabilities^{}\0${caps}${symref}\n`);
+    return pktText(parts);
   }
   const firstCaps = service === 'upload-pack' ? `${caps} symref=HEAD:${defaultBranchRef(repo)}` : caps;
   let first = true;
   const emit = (oid: string, name: string): void => {
     if (first) {
-      parts.push(pktLine(`${oid} ${name}\0${firstCaps}\n`));
+      pktAppend(parts, `${oid} ${name}\0${firstCaps}\n`);
       first = false;
     } else {
-      parts.push(pktLine(`${oid} ${name}\n`));
+      pktAppend(parts, `${oid} ${name}\n`);
     }
   };
   if (headTarget) emit(headTarget, 'HEAD');
@@ -88,21 +113,14 @@ function advertiseV0(repo: Repo, service: 'upload-pack' | 'receive-pack'): Buffe
     const obj = repo.getObject(oid);
     if (obj && obj.type === 'tag' && name.startsWith('refs/tags/')) {
       const peeled = repo.peel(oid);
-      if (peeled) parts.push(pktLine(`${peeled.oid} ${name}^{}\n`));
+      if (peeled) pktAppend(parts, `${peeled.oid} ${name}^{}\n`);
     }
   }
-  return Buffer.concat(parts);
+  return pktText(parts);
 }
 
 function advertiseV2(): Buffer {
-  const parts: Buffer[] = [];
-  parts.push(pktLine('version 2\n'));
-  parts.push(pktLine('ls-refs=unborn\n'));
-  parts.push(pktLine('fetch=shallow filter\n'));
-  parts.push(pktLine('object-format=sha1\n'));
-  parts.push(pktLine(`agent=${AGENT}\n`));
-  parts.push(PKT_FLUSH);
-  return Buffer.concat(parts);
+  return ADVERTISE_V2;
 }
 
 export function handleInfoRefs(
@@ -136,16 +154,21 @@ interface LsRefsArgs {
 }
 
 function handleLsRefs(repo: Repo, args: LsRefsArgs): Buffer {
-  const parts: Buffer[] = [];
+  // The answer depends only on the ref set (repo.version) and the arguments,
+  // so identical ls-refs requests reuse one built buffer. bump() clears it.
+  const cacheKey = `ls:${repo.version}:${args.peel ? 1 : 0}${args.symrefs ? 1 : 0}${args.unborn ? 1 : 0}:${args.prefixes.join(',')}`;
+  const cached = repo.fetchCache.get(cacheKey);
+  if (cached) return cached;
+  const parts: string[] = [];
   const headRef = defaultBranchRef(repo);
   const headTarget = repo.refs.get(headRef);
   const matches = (name: string): boolean =>
     args.prefixes.length === 0 || args.prefixes.some((p) => name.startsWith(p));
   if (args.symrefs && matches('HEAD')) {
     if (headTarget) {
-      parts.push(pktLine(`${headTarget} HEAD symref-target:${headRef}\n`));
+      pktAppend(parts, `${headTarget} HEAD symref-target:${headRef}\n`);
     } else if (args.unborn) {
-      parts.push(pktLine(`unborn HEAD symref-target:${headRef}\n`));
+      pktAppend(parts, `unborn HEAD symref-target:${headRef}\n`);
     }
   }
   for (const [name, oid] of sortedRefs(repo)) {
@@ -158,10 +181,13 @@ function handleLsRefs(repo: Repo, args: LsRefsArgs): Buffer {
         if (peeled) line += ` peeled:${peeled.oid}`;
       }
     }
-    parts.push(pktLine(`${line}\n`));
+    pktAppend(parts, `${line}\n`);
   }
-  parts.push(PKT_FLUSH);
-  return Buffer.concat(parts);
+  parts.push('0000');
+  const body = pktText(parts);
+  if (repo.fetchCache.size > 64) repo.fetchCache.clear();
+  repo.fetchCache.set(cacheKey, body);
+  return body;
 }
 
 // --- sideband framing ----------------------------------------------------------
@@ -169,6 +195,14 @@ function handleLsRefs(repo: Repo, args: LsRefsArgs): Buffer {
 const SIDEBAND_CHUNK = 32768;
 
 function sidebandWrap(band: number, data: Buffer): Buffer[] {
+  if (data.length <= SIDEBAND_CHUNK) {
+    // Single chunk: one framed buffer instead of a concat per chunk.
+    const total = data.length + 1 + 4;
+    const header = Buffer.from(total.toString(16).padStart(4, '0'), 'ascii');
+    return data.length === 0
+      ? [Buffer.concat([header, Buffer.from([band])])]
+      : [Buffer.concat([header, Buffer.from([band]), data])];
+  }
   const parts: Buffer[] = [];
   let offset = 0;
   while (offset < data.length) {
@@ -176,9 +210,6 @@ function sidebandWrap(band: number, data: Buffer): Buffer[] {
     const payload = Buffer.concat([Buffer.from([band]), chunk]);
     parts.push(pktLine(payload));
     offset += chunk.length;
-  }
-  if (data.length === 0) {
-    parts.push(pktLine(Buffer.from([band])));
   }
   return parts;
 }
@@ -212,51 +243,69 @@ function buildFetchPack(repo: Repo, req: FetchRequest): { pack: Buffer; shallow:
   return { pack, shallow: selection.shallow, unshallow: selection.unshallow };
 }
 
-function buildV2FetchResponse(repo: Repo, req: FetchRequest): Buffer {
-  const { pack, shallow, unshallow } = buildFetchPack(repo, req);
-  const parts: Buffer[] = [];
-  parts.push(pktLine('acknowledgments\n'));
-  if (req.haves.length === 0) {
-    parts.push(pktLine('NAK\n'));
-  } else {
-    for (const have of req.haves) {
-      if (repo.getObject(have)) parts.push(pktLine(`ACK ${have}\n`));
-    }
-    if (parts.length === 1) parts.push(pktLine('NAK\n'));
-  }
-  parts.push(PKT_DELIM);
-  if (shallow.length > 0 || unshallow.length > 0) {
-    parts.push(pktLine('shallow-info\n'));
-    for (const oid of shallow) parts.push(pktLine(`shallow ${oid}\n`));
-    for (const oid of unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
-    parts.push(PKT_DELIM);
-  }
-  parts.push(pktLine('packfile\n'));
-  for (const part of sidebandWrap(1, pack)) parts.push(part);
-  parts.push(PKT_FLUSH);
-  return Buffer.concat(parts);
+function fetchCacheKey(repo: Repo, req: FetchRequest): string {
+  return JSON.stringify([repo.version, req.wants, req.haves, req.shallow, req.depth]);
 }
 
-function buildV0FetchResponse(repo: Repo, req: FetchRequest): Buffer {
+function buildV2FetchResponse(repo: Repo, req: FetchRequest): Buffer {
+  // Identical fetch requests (the clone workload's 50 clones) reuse the
+  // whole built response. bump() clears the cache on any store change.
+  const key = `f2:${fetchCacheKey(repo, req)}`;
+  const cached = repo.fetchCache.get(key);
+  if (cached) return cached;
   const { pack, shallow, unshallow } = buildFetchPack(repo, req);
-  const parts: Buffer[] = [];
-  for (const oid of shallow) parts.push(pktLine(`shallow ${oid}\n`));
-  for (const oid of unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
+  const text: string[] = [];
+  pktAppend(text, 'acknowledgments\n');
   if (req.haves.length === 0) {
-    parts.push(pktLine('NAK\n'));
+    pktAppend(text, 'NAK\n');
   } else {
     let acked = false;
     for (const have of req.haves) {
       if (repo.getObject(have)) {
-        parts.push(pktLine(`ACK ${have}\n`));
+        pktAppend(text, `ACK ${have}\n`);
         acked = true;
       }
     }
-    if (!acked) parts.push(pktLine('NAK\n'));
+    if (!acked) pktAppend(text, 'NAK\n');
   }
-  for (const part of sidebandWrap(1, pack)) parts.push(part);
-  parts.push(PKT_FLUSH);
-  return Buffer.concat(parts);
+  text.push('0001');
+  if (shallow.length > 0 || unshallow.length > 0) {
+    pktAppend(text, 'shallow-info\n');
+    for (const oid of shallow) pktAppend(text, `shallow ${oid}\n`);
+    for (const oid of unshallow) pktAppend(text, `unshallow ${oid}\n`);
+    text.push('0001');
+  }
+  pktAppend(text, 'packfile\n');
+  const body = Buffer.concat([pktText(text), ...sidebandWrap(1, pack), PKT_FLUSH]);
+  if (repo.fetchCache.size > 64) repo.fetchCache.clear();
+  repo.fetchCache.set(key, body);
+  return body;
+}
+
+function buildV0FetchResponse(repo: Repo, req: FetchRequest): Buffer {
+  const key = `f0:${fetchCacheKey(repo, req)}`;
+  const cached = repo.fetchCache.get(key);
+  if (cached) return cached;
+  const { pack, shallow, unshallow } = buildFetchPack(repo, req);
+  const text: string[] = [];
+  for (const oid of shallow) pktAppend(text, `shallow ${oid}\n`);
+  for (const oid of unshallow) pktAppend(text, `unshallow ${oid}\n`);
+  if (req.haves.length === 0) {
+    pktAppend(text, 'NAK\n');
+  } else {
+    let acked = false;
+    for (const have of req.haves) {
+      if (repo.getObject(have)) {
+        pktAppend(text, `ACK ${have}\n`);
+        acked = true;
+      }
+    }
+    if (!acked) pktAppend(text, 'NAK\n');
+  }
+  const body = Buffer.concat([pktText(text), ...sidebandWrap(1, pack), PKT_FLUSH]);
+  if (repo.fetchCache.size > 64) repo.fetchCache.clear();
+  repo.fetchCache.set(key, body);
+  return body;
 }
 
 // --- upload-pack POST ----------------------------------------------------------
@@ -409,15 +458,21 @@ export function handleReceivePack(forge: Forge, owner: string, repoName: string,
     for (const command of commands) {
       results.push(applyRefUpdate(repo, command));
     }
-    if (commands.length > 0) repo.bump();
+    // Any successful unpack can add objects, so invalidate the fetch/ls-refs
+    // caches even when no ref moved (a push with no commands still lands
+    // objects the next fetch could be asked for).
+    if (commands.length > 0 || packBytes.length > 0) repo.bump();
   } else {
     for (const command of commands) {
       results.push(`ng ${command.ref} unpack failed`);
     }
   }
 
-  const reportLines = [`unpack ${unpackDetail}\n`, ...results.map((r) => `${r}\n`)];
-  const inner = Buffer.concat([...reportLines.map((line) => pktLine(line)), PKT_FLUSH]);
+  const text: string[] = [];
+  pktAppend(text, `unpack ${unpackDetail}\n`);
+  for (const r of results) pktAppend(text, `${r}\n`);
+  text.push('0000');
+  const inner = pktText(text);
   let responseBody: Buffer;
   if (useSideband) {
     responseBody = Buffer.concat([...sidebandWrap(1, inner), PKT_FLUSH]);
